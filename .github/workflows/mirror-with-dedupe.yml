@@ -1,0 +1,166 @@
+name: Mirror new issues to private (with dedupe)
+
+on:
+  issues:
+    types: [opened] # add "edited" if you also want to dedupe on edits
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    if: ${{ github.actor != 'github-actions[bot]' }}
+
+    steps:
+      - name: Dedupe in public repo (close new duplicates)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_MIRROR_TOKEN }}
+          script: |
+            const crypto = require('crypto');
+            const pubIssue = context.payload.issue;
+            const owner = context.repo.owner; // SteamifiedTesting
+            const repo  = context.repo.repo;  // issue_public
+
+            // Normalize small diffs so duplicates are caught reliably
+            const normalize = (s) =>
+              (s || '')
+                .replace(/\r\n/g, '\n')
+                .replace(/[ \t]+/g, ' ')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim()
+                .toLowerCase();
+
+            const title = normalize(pubIssue.title);
+            const body  = normalize(pubIssue.body);
+
+            // Stable fingerprint (title + body). Use title-only by changing the input below.
+            const fp = crypto.createHash('sha256').update(`${title}\n---\n${body}`).digest('hex').slice(0, 16);
+            const keyLabel = `dedupe-key:${fp}`;
+
+            // Find any *other* issue already marked with this fingerprint
+            const q = `repo:${owner}/${repo} is:issue label:"${keyLabel}"`;
+            const res = await github.rest.search.issuesAndPullRequests({ q });
+            const existing = (res.data.items || []).find(i => i.number !== pubIssue.number);
+
+            if (!existing) {
+              // First occurrence => mark canonical and stash the key
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: pubIssue.number,
+                labels: [keyLabel, 'canonical']
+              });
+              core.setOutput('is_duplicate', 'false');
+            } else {
+              // Duplicate => label, comment, close, and short-circuit the job
+              try {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: pubIssue.number,
+                  labels: ['duplicate', keyLabel]
+                });
+              } catch {}
+
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pubIssue.number,
+                body: `This issue duplicates #${existing.number}. Please follow updates there.`
+              });
+
+              await github.rest.issues.update({
+                owner, repo, issue_number: pubIssue.number,
+                state: 'closed'
+              });
+
+              core.setOutput('is_duplicate', 'true');
+            }
+        id: dedupe
+
+      - name: Stop if this was a duplicate
+        if: steps.dedupe.outputs.is_duplicate == 'true'
+        run: echo "Duplicate detected; skipping mirror."
+
+      - name: Mirror canonical to private repo
+        if: steps.dedupe.outputs.is_duplicate != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_MIRROR_TOKEN }}
+          script: |
+            const crypto = require('crypto');
+            const pubIssue = context.payload.issue;
+            const pubOwner = context.repo.owner;      // SteamifiedTesting
+            const pubRepo  = context.repo.repo;       // issue_public
+
+            const privateOwner = 'SteamifiedTesting';
+            const privateRepo  = 'issue_private';
+
+            // Recompute the same fingerprint so we can label the mirror too
+            const normalize = (s) =>
+              (s || '')
+                .replace(/\r\n/g, '\n')
+                .replace(/[ \t]+/g, ' ')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim()
+                .toLowerCase();
+            const title = normalize(pubIssue.title);
+            const body  = normalize(pubIssue.body);
+            const fp = crypto.createHash('sha256').update(`${title}\n---\n${body}`).digest('hex').slice(0, 16);
+
+            const mirrorKey = `mirror-key:${fp}`;
+            const mirroredFrom = `<!-- mirrored-from: ${pubOwner}/${pubRepo}#${pubIssue.number} -->`;
+            const mirroredToMarkerPrefix = '<!-- mirrored-to:';
+
+            // 0) Avoid appending multiple mirrored-to markers if re-run
+            const existingBody = pubIssue.body || '';
+            let newPublicBody = existingBody.includes(mirroredToMarkerPrefix)
+              ? existingBody
+              : `${existingBody}\n\n`; // we'll append marker after creating mirror
+
+            // 1) Check if a mirror already exists in private (label first, then body marker fallback)
+            const qPrivLabel = `repo:${privateOwner}/${privateRepo} is:issue label:"${mirrorKey}"`;
+            const searchLabel = await github.rest.search.issuesAndPullRequests({ q: qPrivLabel });
+            let privExisting = searchLabel.data.items?.[0];
+
+            if (!privExisting) {
+              const qPrivBody = `repo:${privateOwner}/${privateRepo} is:issue in:body "mirrored-from: ${pubOwner}/${pubRepo}#${pubIssue.number}"`;
+              const searchBody = await github.rest.search.issuesAndPullRequests({ q: qPrivBody });
+              privExisting = searchBody.data.items?.[0];
+            }
+
+            let privateNumber;
+
+            if (privExisting) {
+              privateNumber = privExisting.number;
+              // Ensure label exists and add a sync note
+              try {
+                await github.rest.issues.addLabels({
+                  owner: privateOwner, repo: privateRepo, issue_number: privateNumber,
+                  labels: [mirrorKey, 'mirrored-from-public']
+                });
+              } catch {}
+              await github.rest.issues.createComment({
+                owner: privateOwner, repo: privateRepo, issue_number: privateNumber,
+                body: `Update from origin ${pubOwner}/${pubRepo}#${pubIssue.number}.`
+              });
+            } else {
+              // 2) Create twin issue in PRIVATE
+              const created = await github.rest.issues.create({
+                owner: privateOwner,
+                repo: privateRepo,
+                title: pubIssue.title,
+                body: `${pubIssue.body || ''}\n\n${mirroredFrom}`,
+                labels: [mirrorKey, 'mirrored-from-public', ...(pubIssue.labels || []).map(l => typeof l === 'string' ? l : l.name)],
+              });
+              privateNumber = created.data.number;
+            }
+
+            // 3) Add hidden mapping marker to PUBLIC (if not already present)
+            const marker = `<!-- mirrored-to: ${privateOwner}/${privateRepo}#${privateNumber} -->`;
+            if (!newPublicBody.includes(marker)) {
+              newPublicBody = `${newPublicBody}${marker}`;
+              await github.rest.issues.update({
+                owner: pubOwner,
+                repo: pubRepo,
+                issue_number: pubIssue.number,
+                body: newPublicBody,
+              });
+            }

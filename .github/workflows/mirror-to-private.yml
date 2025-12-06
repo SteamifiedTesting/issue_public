@@ -1,4 +1,4 @@
-name: Mirror new issues to private (by type)
+name: Mirror new issues to private
 
 on:
   issues:
@@ -8,60 +8,35 @@ permissions:
   contents: read
   issues: write
 
-env:
-  ISSUE_TYPE_TO_MIRROR: "Epic"   # ✅ Edit this once to control type
-
 jobs:
   mirror:
     runs-on: ubuntu-latest
     if: ${{ github.actor != 'github-actions[bot]' }}
 
     steps:
-      - name: Mirror to private repo if type matches
+      - name: Mirror to private repo
         uses: actions/github-script@v7
         with:
+          # Use the org-wide secret
           github-token: ${{ secrets.REPO_MIRROR_TOKEN }}
           script: |
             const pubIssue = context.payload.issue;
-            const pubOwner = context.repo.owner;
-            const pubRepo  = context.repo.repo;
+            const pubOwner = context.repo.owner;      // SteamifiedTesting
+            const pubRepo  = context.repo.repo;       // issue_public
+
             const privateOwner = 'SteamifiedTesting';
             const privateRepo  = 'issue_private';
-            const requiredType = process.env.ISSUE_TYPE_TO_MIRROR;
 
-            // 1️⃣ Fetch Issue Type via GraphQL
-            const query = `
-              query($owner: String!, $repo: String!, $number: Int!) {
-                repository(owner: $owner, name: $repo) {
-                  issue(number: $number) {
-                    issueType { name }
-                  }
-                }
-              }
-            `;
-            const res = await github.graphql(query, {
-              owner: pubOwner,
-              repo: pubRepo,
-              number: pubIssue.number,
-            });
-            const issueTypeName = res.repository.issue?.issueType?.name || null;
-            core.info(`🧩 Issue Type detected: ${issueTypeName}`);
-
-            // 2️⃣ Skip unless it matches configured type
-            if (issueTypeName !== requiredType) {
-              core.info(`⏭️ Not a ${requiredType} — skipping mirror.`);
-              return;
-            }
-
-            // 3️⃣ Create twin issue in PRIVATE repo
+            // 1) Create twin issue in PRIVATE
             const created = await github.rest.issues.create({
               owner: privateOwner,
               repo: privateRepo,
               title: pubIssue.title,
               body: `${pubIssue.body || ''}\n\n<!-- mirrored-from: ${pubOwner}/${pubRepo}#${pubIssue.number} -->`,
+              labels: (pubIssue.labels || []).map(l => typeof l === 'string' ? l : l.name),
             });
 
-            // 4️⃣ Add hidden mapping marker to PUBLIC issue
+            // 2) Add hidden mapping marker to PUBLIC
             const marker = `<!-- mirrored-to: ${privateOwner}/${privateRepo}#${created.data.number} -->`;
             await github.rest.issues.update({
               owner: pubOwner,
@@ -69,5 +44,3 @@ jobs:
               issue_number: pubIssue.number,
               body: `${pubIssue.body || ''}\n\n${marker}`,
             });
-
-            core.info(`✅ Mirrored ${requiredType} ${pubOwner}/${pubRepo}#${pubIssue.number} → ${privateRepo}#${created.data.number}`);

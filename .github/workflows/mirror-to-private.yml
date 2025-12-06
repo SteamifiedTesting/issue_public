@@ -18,7 +18,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           # Use the org-wide secret
-          github-token: ${{ secrets.ORG_REPO_MIRROR_TOKEN }}
+          github-token: ${{ secrets.REPO_MIRROR_TOKEN }}
           script: |
             const pubIssue = context.payload.issue;
             const pubOwner = context.repo.owner;      // SteamifiedTesting

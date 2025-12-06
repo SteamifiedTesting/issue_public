@@ -1,4 +1,4 @@
-name: Mirror new issues to private
+name: Mirror new Epic issues to private
 
 on:
   issues:
@@ -14,29 +14,52 @@ jobs:
     if: ${{ github.actor != 'github-actions[bot]' }}
 
     steps:
-      - name: Mirror to private repo
+      - name: Check issue type and mirror if Epic
         uses: actions/github-script@v7
         with:
-          # Use the org-wide secret
           github-token: ${{ secrets.REPO_MIRROR_TOKEN }}
           script: |
             const pubIssue = context.payload.issue;
-            const pubOwner = context.repo.owner;      // SteamifiedTesting
-            const pubRepo  = context.repo.repo;       // issue_public
-
+            const pubOwner = context.repo.owner;
+            const pubRepo  = context.repo.repo;
             const privateOwner = 'SteamifiedTesting';
             const privateRepo  = 'issue_private';
 
-            // 1) Create twin issue in PRIVATE
+            // 1️⃣ Query GitHub GraphQL API for issue type
+            const query = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    issueType { name }
+                  }
+                }
+              }
+            `;
+
+            const response = await github.graphql(query, {
+              owner: pubOwner,
+              repo: pubRepo,
+              number: pubIssue.number,
+            });
+
+            const issueTypeName = response.repository.issue?.issueType?.name || null;
+            core.info(`🧩 Issue Type detected: ${issueTypeName}`);
+
+            // 2️⃣ Skip unless it's an Epic
+            if (issueTypeName !== 'Epic') {
+              core.info('⏭️ Not an Epic — skipping mirror.');
+              return;
+            }
+
+            // 3️⃣ Create twin issue in PRIVATE repo
             const created = await github.rest.issues.create({
               owner: privateOwner,
               repo: privateRepo,
               title: pubIssue.title,
               body: `${pubIssue.body || ''}\n\n<!-- mirrored-from: ${pubOwner}/${pubRepo}#${pubIssue.number} -->`,
-              labels: (pubIssue.labels || []).map(l => typeof l === 'string' ? l : l.name),
             });
 
-            // 2) Add hidden mapping marker to PUBLIC
+            // 4️⃣ Add hidden marker back to PUBLIC issue
             const marker = `<!-- mirrored-to: ${privateOwner}/${privateRepo}#${created.data.number} -->`;
             await github.rest.issues.update({
               owner: pubOwner,
@@ -44,3 +67,5 @@ jobs:
               issue_number: pubIssue.number,
               body: `${pubIssue.body || ''}\n\n${marker}`,
             });
+
+            core.info(`✅ Mirrored Epic ${pubOwner}/${pubRepo}#${pubIssue.number} → ${privateRepo}#${created.data.number}`);

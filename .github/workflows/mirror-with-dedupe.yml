@@ -24,8 +24,6 @@ jobs:
             const { owner, repo } = context.repo;
             const cur = context.payload.issue;
 
-            core.info(`▶ DEDUPE: Start for #${cur.number} "${cur.title}"`);
-
             const normalize = (s) =>
               (s || '')
                 .replace(/\r\n/g, '\n')
@@ -42,17 +40,19 @@ jobs:
             const curFp = fpOf(cur.title, cur.body);
             const dedupeMarker = `<!-- dedupe-key:${curFp} -->`;
 
-            core.info(`DED: Fingerprint(cur) = ${curFp}`);
+            const stripMirrorMarkers = (body) => (body || '')
+              .replace(/<!--\s*mirrored-to:[\s\S]*?-->\s*/gi, '')
+              .replace(/<!--\s*mirror-key:[\s\S]*?-->\s*/gi, '')
+              .replace(/<!--\s*mirrored-from:[\s\S]*?-->\s*/gi, '');
 
             const listIssues = async (state) => github.paginate(
               github.rest.issues.listForRepo,
               { owner, repo, state, per_page: 100, sort: 'created', direction: 'desc' }
             );
 
+            // Prefer search by fp marker (covers beyond 200)
             const qKey = `repo:${owner}/${repo} is:issue in:body "dedupe-key:${curFp}"`;
-            core.info(`DED: Search by key: ${qKey}`);
             const searched = await github.rest.search.issuesAndPullRequests({ q: qKey });
-            core.info(`DED: Search hits = ${searched.data.items?.length || 0}`);
 
             let canonical = null;
             if (searched.data.items?.length) {
@@ -62,11 +62,11 @@ jobs:
               }
             }
 
+            // Fallback: recent window + light retry for listing lag
             if (!canonical) {
-              core.info('DED: Checking recent issues as fallback...');
               const openIssues   = await listIssues('open');
               const closedIssues = await listIssues('closed');
-              const window = [...openIssues.slice(0,200), ...closedIssues.slice(0,200)];
+              const window = [...openIssues.slice(0, 200), ...closedIssues.slice(0, 200)];
 
               const findOlderCanonical = async () => {
                 for (const it of window) {
@@ -85,27 +85,31 @@ jobs:
             }
 
             if (!canonical) {
-              // Treat as canonical-lite
-              const currentBody = cur.body || '';
-              if (!currentBody.includes(dedupeMarker)) {
+              // Mark as canonical-lite: stamp hidden fp key only
+              const latest = await github.rest.issues.get({ owner, repo, issue_number: cur.number });
+              const body = latest.data.body || '';
+              if (!body.includes(dedupeMarker)) {
                 await github.rest.issues.update({
                   owner, repo, issue_number: cur.number,
-                  body: `${currentBody}\n\n${dedupeMarker}`
+                  body: `${body}\n\n${dedupeMarker}`
                 });
-                core.info('DED: Added dedupe marker');
               }
               core.setOutput('is_duplicate', 'false');
-              core.info('✔ DEDUPE RESULT: Canonical (proceed to mirror)');
             } else {
+              // DUPLICATE: label, comment, close, and STRIP any mirror markers from public
               try { await github.rest.issues.addLabels({ owner, repo, issue_number: cur.number, labels: ['duplicate'] }); } catch {}
               await github.rest.issues.createComment({
                 owner, repo, issue_number: cur.number,
                 body: `This issue duplicates #${canonical.number}. Please follow updates there.`
               });
-              await github.rest.issues.update({ owner, repo, issue_number: cur.number, state: 'closed' });
+
+              const latest = await github.rest.issues.get({ owner, repo, issue_number: cur.number });
+              const cleaned = stripMirrorMarkers(latest.data.body || '');
+
+              await github.rest.issues.update({ owner, repo, issue_number: cur.number, body: cleaned, state: 'closed' });
               try { await github.rest.issues.removeLabel({ owner, repo, issue_number: cur.number, name: 'canonical' }); } catch {}
+
               core.setOutput('is_duplicate', 'true');
-              core.info('✖ DEDUPE RESULT: Duplicate (skip mirror)');
             }
 
       - name: Stop if duplicate (do NOT mirror to private)
@@ -127,8 +131,6 @@ jobs:
             const privateOwner = 'SteamifiedTesting';
             const privateRepo  = 'issue_private';
 
-            core.info(`▶ MIRROR: Start for #${pubIssue.number}`);
-
             const normalize = (s) =>
               (s || '')
                 .replace(/\r\n/g, '\n')
@@ -148,7 +150,7 @@ jobs:
             const mirroredTo      = (num) => `<!-- mirrored-to: ${privateOwner}/${privateRepo}#${num} -->`;
             const mirroredToPrefix = '<!-- mirrored-to:';
 
-            // Revalidate canonicality
+            // Revalidate canonicality one more time (older-number wins)
             const owner = pubOwner, repo = pubRepo;
             const listIssues = async (state) => github.paginate(
               github.rest.issues.listForRepo,
@@ -166,20 +168,28 @@ jobs:
             }
 
             if (olderMatch) {
-              core.info(`MIR: Revalidation found older #${olderMatch.number} — marking duplicate`);
+              // Convert to duplicate and DO NOT mirror; also strip any mirror markers just in case
               try { await github.rest.issues.addLabels({ owner, repo, issue_number: pubIssue.number, labels: ['duplicate'] }); } catch {}
               await github.rest.issues.createComment({
                 owner, repo, issue_number: pubIssue.number,
                 body: `This issue duplicates #${olderMatch.number}. Please follow updates there.`
               });
-              await github.rest.issues.update({ owner, repo, issue_number: pubIssue.number, state: 'closed' });
+
+              const latest = await github.rest.issues.get({ owner, repo, issue_number: pubIssue.number });
+              const cleaned = (latest.data.body || '')
+                .replace(/<!--\s*mirrored-to:[\s\S]*?-->\s*/gi, '')
+                .replace(/<!--\s*mirror-key:[\s\S]*?-->\s*/gi, '')
+                .replace(/<!--\s*mirrored-from:[\s\S]*?-->\s*/gi, '');
+
+              await github.rest.issues.update({ owner, repo, issue_number: pubIssue.number, body: cleaned, state: 'closed' });
               try { await github.rest.issues.removeLabel({ owner, repo, issue_number: pubIssue.number, name: 'canonical' }); } catch {}
+
               core.setOutput('was_mirrored', 'false');
               core.setOutput('private_issue_number', '');
               return;
             }
 
-            // Mirror canonical
+            // Canonical → create/find private mirror (NO labels in private)
             const qPrivOrigin = `repo:${privateOwner}/${privateRepo} is:issue in:body "mirrored-from: ${pubOwner}/${pubRepo}#${pubIssue.number}"`;
             const srch1 = await github.rest.search.issuesAndPullRequests({ q: qPrivOrigin });
             let match = srch1.data.items?.[0];
@@ -193,7 +203,6 @@ jobs:
             let privateNum;
             if (match) {
               privateNum = match.number;
-              core.info(`MIR: Found existing private mirror #${privateNum}`);
             } else {
               const created = await github.rest.issues.create({
                 owner: privateOwner,
@@ -202,28 +211,28 @@ jobs:
                 body: `${pubIssue.body || ''}\n\n${mirroredFrom}\n${mirrorKeyMarker}`
               });
               privateNum = created.data.number;
-              core.info(`MIR: Created new private mirror #${privateNum}`);
             }
 
-            // Add backlink
-            const existingBody = pubIssue.body || '';
+            // Add backlink ONLY NOW (after mirror exists), against latest body
+            const latestPub = await github.rest.issues.get({ owner: pubOwner, repo: pubRepo, issue_number: pubIssue.number });
+            const existingBody = latestPub.data.body || '';
             const marker = mirroredTo(privateNum);
             if (!existingBody.includes(marker)) {
-              const newBody = `${existingBody}\n\n${marker}`;
+              const newBody = existingBody.includes(mirroredToPrefix)
+                ? existingBody
+                : `${existingBody}\n\n${marker}`;
               await github.rest.issues.update({
                 owner: pubOwner,
                 repo: pubRepo,
                 issue_number: pubIssue.number,
                 body: newBody
               });
-              core.info(`MIR: Added back-link to private #${privateNum}`);
             }
 
             core.setOutput('was_mirrored', 'true');
             core.setOutput('private_issue_number', String(privateNum));
-            core.info('✔ MIRROR RESULT: Private mirror confirmed.');
 
-      - name: Mark canonical in public (only if mirror exists)
+      - name: Mark canonical in public (only if mirror exists and still open)
         if: >
           steps.mirror_to_private.outputs.was_mirrored == 'true' &&
           steps.mirror_to_private.outputs.private_issue_number != '' &&
@@ -238,20 +247,14 @@ jobs:
             const privateOwner = 'SteamifiedTesting';
             const privateRepo  = 'issue_private';
 
-            core.info(`▶ LABEL: Verify mirror exists for #${num}`);
+            // Verify a private mirror really exists before labeling
             const q = `repo:${privateOwner}/${privateRepo} is:issue in:body "mirrored-from: ${owner}/${repo}#${num}"`;
             const res = await github.rest.search.issuesAndPullRequests({ q });
-            const hits = res.data.items?.length || 0;
-            core.info(`LABEL: Mirror search hits = ${hits}`);
-
-            if (hits === 0) {
+            if (!res.data.items || res.data.items.length === 0) {
               core.info('LABEL: No private mirror found — skipping canonical label.');
               return;
             }
 
             try {
               await github.rest.issues.addLabels({ owner, repo, issue_number: num, labels: ['canonical'] });
-              core.info('✔ LABEL: Added canonical label.');
-            } catch (e) {
-              core.warning(`LABEL: Failed to add canonical — ${e.message}`);
-            }
+            } catch {}

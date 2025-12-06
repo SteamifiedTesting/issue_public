@@ -1,0 +1,82 @@
+name: Sync updates to private
+
+on:
+  issues:
+    types: [edited, labeled, unlabeled, reopened, closed, assigned, unassigned]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: ${{ github.actor != 'github-actions[bot]' }}
+
+    steps:
+      - name: Sync updates to private repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_MIRROR_TOKEN }}
+          script: |
+            const pubIssue = context.payload.issue;
+            const body = pubIssue.body || '';
+
+            // Look for the mirrored-to marker
+            const match = body.match(/<!--\s*mirrored-to:\s*([\w.-]+)\/([\w.-]+)#(\d+)\s*-->/i);
+            if (!match) {
+              core.info('No mirrored-to marker found; skipping.');
+              return;
+            }
+
+            const [, privateOwner, privateRepo, privateNumStr] = match;
+            const privateNum = parseInt(privateNumStr, 10);
+            const newTitle = pubIssue.title;
+            const labels   = (pubIssue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            const newState = pubIssue.state; // open / closed
+
+            // Strip mirrored-to marker to avoid duplication
+            const strippedBody = body.replace(/<!--\s*mirrored-to:[\s\S]*?-->/i, '').trim();
+
+            // Preserve mirrored-from marker in private issue
+            const privateIssue = await github.rest.issues.get({
+              owner: privateOwner, repo: privateRepo, issue_number: privateNum
+            });
+            const privateBody = privateIssue.data.body || '';
+            const fromMarker = (privateBody.match(/<!--\s*mirrored-from:[\s\S]*?-->/i) || [''])[0];
+
+            const finalBody = `${strippedBody}\n\n${fromMarker}`.trim();
+
+            // Ensure labels exist in private repo
+            const allPrivLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              owner: privateOwner, repo: privateRepo, per_page: 100
+            });
+            const privLabelNames = new Set(allPrivLabels.map(l => l.name));
+            const missing = labels.filter(l => !privLabelNames.has(l));
+            for (const name of missing) {
+              try {
+                await github.rest.issues.createLabel({ owner: privateOwner, repo: privateRepo, name });
+              } catch (e) {
+                core.warning(`Could not create label "${name}" in private: ${e.message}`);
+              }
+            }
+
+            // Update private issue fields
+            await github.rest.issues.update({
+              owner: privateOwner,
+              repo: privateRepo,
+              issue_number: privateNum,
+              title: newTitle,
+              body: finalBody,
+              state: newState
+            });
+
+            // Replace labels to match public
+            await github.rest.issues.setLabels({
+              owner: privateOwner,
+              repo: privateRepo,
+              issue_number: privateNum,
+              labels
+            });
+
+            core.info(`✅ Synced changes from ${context.repo.repo}#${pubIssue.number} → ${privateRepo}#${privateNum}`);

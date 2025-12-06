@@ -17,15 +17,17 @@ jobs:
       - name: Mirror to private repo
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Use the org-wide secret
+          github-token: ${{ secrets.ORG_REPO_MIRROR_TOKEN }}
           script: |
             const pubIssue = context.payload.issue;
-            const pubOwner = context.repo.owner;
-            const pubRepo  = context.repo.repo;
+            const pubOwner = context.repo.owner;      // SteamifiedTesting
+            const pubRepo  = context.repo.repo;       // issue_public
 
             const privateOwner = 'SteamifiedTesting';
             const privateRepo  = 'issue_private';
 
+            // 1) Create twin issue in PRIVATE
             const created = await github.rest.issues.create({
               owner: privateOwner,
               repo: privateRepo,
@@ -34,6 +36,7 @@ jobs:
               labels: (pubIssue.labels || []).map(l => typeof l === 'string' ? l : l.name),
             });
 
+            // 2) Add hidden mapping marker to PUBLIC
             const marker = `<!-- mirrored-to: ${privateOwner}/${privateRepo}#${created.data.number} -->`;
             await github.rest.issues.update({
               owner: pubOwner,

@@ -1,0 +1,43 @@
+name: Mirror new issues to private
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    if: ${{ github.actor != 'github-actions[bot]' }}
+
+    steps:
+      - name: Mirror to private repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pubIssue = context.payload.issue;
+            const pubOwner = context.repo.owner;
+            const pubRepo  = context.repo.repo;
+
+            const privateOwner = 'SteamifiedTesting';
+            const privateRepo  = 'issue_private';
+
+            const created = await github.rest.issues.create({
+              owner: privateOwner,
+              repo: privateRepo,
+              title: pubIssue.title,
+              body: `${pubIssue.body || ''}\n\n<!-- mirrored-from: ${pubOwner}/${pubRepo}#${pubIssue.number} -->`,
+              labels: (pubIssue.labels || []).map(l => typeof l === 'string' ? l : l.name),
+            });
+
+            const marker = `<!-- mirrored-to: ${privateOwner}/${privateRepo}#${created.data.number} -->`;
+            await github.rest.issues.update({
+              owner: pubOwner,
+              repo: pubRepo,
+              issue_number: pubIssue.number,
+              body: `${pubIssue.body || ''}\n\n${marker}`,
+            });
